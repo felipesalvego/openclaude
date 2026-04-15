@@ -82,6 +82,20 @@ const COPILOT_HEADERS: Record<string, string> = {
   'Copilot-Integration-Id': 'vscode-chat',
 }
 
+// ---------------------------------------------------------------------------
+// Ollama detection — disables streaming when tools are present to avoid
+// the known Ollama /v1/chat/completions streaming bug that silently drops
+// tool_calls from the response. See: ollama/ollama#9632, ollama/ollama#12557
+// ---------------------------------------------------------------------------
+function isOllamaProvider(baseUrl: string | undefined): boolean {
+  if (!baseUrl) return false
+  return (
+    baseUrl.includes('localhost:11434') ||
+    baseUrl.includes('127.0.0.1:11434') ||
+    baseUrl.includes('ollama')
+  )
+}
+
 function isGithubModelsMode(): boolean {
   return isEnvTruthy(process.env.CLAUDE_CODE_USE_GITHUB)
 }
@@ -388,14 +402,8 @@ function convertMessages(
 
               // Handle Gemini thought_signature
               if (isGeminiMode()) {
-                // If the model provided a signature in the tool_use block itself (e.g. from a previous Turn/Step)
-                // Use thinkingBlock.signature for ALL tool calls in the same assistant turn if available.
-                // The API requires the same signature on every replayed function call part in a parallel set.
                 const signature = tu.signature ?? (thinkingBlock as any)?.signature
-
-                // Merge into existing google-specific metadata if present
                 const existingGoogle = (toolCall.extra_content?.google as Record<string, unknown>) ?? {}
-
                 toolCall.extra_content = {
                   ...toolCall.extra_content,
                   google: {
@@ -423,11 +431,6 @@ function convertMessages(
     }
   }
 
-  // Coalescing pass: merge consecutive messages of the same role.
-  // OpenAI/vLLM/Ollama require strict user↔assistant alternation.
-  // Multiple consecutive tool messages are allowed (assistant → tool* → user).
-  // Consecutive user or assistant messages must be merged to avoid Jinja
-  // template errors like "roles must alternate" (Devstral, Mistral models).
   const coalesced: OpenAIMessage[] = []
   for (const msg of result) {
     const prev = coalesced[coalesced.length - 1]
@@ -460,12 +463,6 @@ function convertMessages(
   return coalesced
 }
 
-/**
- * OpenAI requires every key in `properties` to also appear in `required`.
- * Anthropic schemas often mark fields as optional (omitted from `required`),
- * which causes 400 errors on OpenAI/Codex endpoints. This normalizes the
- * schema by ensuring `required` is a superset of `properties` keys.
- */
 function normalizeSchemaForOpenAI(
   schema: Record<string, unknown>,
   strict = true,
@@ -476,7 +473,6 @@ function normalizeSchemaForOpenAI(
     const properties = record.properties as Record<string, Record<string, unknown>>
     const existingRequired = Array.isArray(record.required) ? record.required as string[] : []
 
-    // Recurse into each property
     const normalizedProps: Record<string, unknown> = {}
     for (const [key, value] of Object.entries(properties)) {
       normalizedProps[key] = normalizeSchemaForOpenAI(
@@ -487,21 +483,13 @@ function normalizeSchemaForOpenAI(
     record.properties = normalizedProps
 
     if (strict) {
-      // Keep only the properties that were originally marked required in the schema.
-      // Adding every property to required[] (the previous behaviour) caused strict
-      // OpenAI-compatible providers (Groq, Azure, etc.) to reject tool calls because
-      // the model correctly omits optional arguments — but the provider treats them
-      // as missing required fields and returns a 400 / tool_use_failed error.
       record.required = existingRequired.filter(k => k in normalizedProps)
-      // additionalProperties: false is still required by strict-mode providers.
       record.additionalProperties = false
     } else {
-      // For Gemini: keep only existing required keys that are present in properties
       record.required = existingRequired.filter(k => k in normalizedProps)
     }
   }
 
-  // Recurse into array items
   if ('items' in record) {
     if (Array.isArray(record.items)) {
       record.items = (record.items as unknown[]).map(
@@ -512,7 +500,6 @@ function normalizeSchemaForOpenAI(
     }
   }
 
-  // Recurse into combinators
   for (const key of ['anyOf', 'oneOf', 'allOf'] as const) {
     if (key in record && Array.isArray(record[key])) {
       record[key] = (record[key] as unknown[]).map(
@@ -530,12 +517,10 @@ function convertTools(
   const isGemini = isGeminiMode()
 
   return tools
-    .filter(t => t.name !== 'ToolSearchTool') // Not relevant for OpenAI
+    .filter(t => t.name !== 'ToolSearchTool')
     .map(t => {
       const schema = { ...(t.input_schema ?? { type: 'object', properties: {} }) } as Record<string, unknown>
 
-      // For Codex/OpenAI: promote known Agent sub-fields into required[] only if
-      // they actually exist in properties (Gemini rejects required keys absent from properties).
       if (t.name === 'Agent' && schema.properties) {
         const props = schema.properties as Record<string, unknown>
         if (!Array.isArray(schema.required)) schema.required = []
@@ -601,8 +586,6 @@ function convertChunkUsage(
 
   const cached = usage.prompt_tokens_details?.cached_tokens ?? 0
   return {
-    // Subtract cached tokens: OpenAI includes them in prompt_tokens,
-    // but Anthropic convention treats input_tokens as non-cached only.
     input_tokens: (usage.prompt_tokens ?? 0) - cached,
     output_tokens: usage.completion_tokens ?? 0,
     cache_creation_input_tokens: 0,
@@ -634,10 +617,6 @@ function repairPossiblyTruncatedObjectJson(raw: string): string | null {
   }
 }
 
-/**
- * Async generator that transforms an OpenAI SSE stream into
- * Anthropic-format BetaRawMessageStreamEvent objects.
- */
 async function* openaiStreamToAnthropic(
   response: Response,
   model: string,
@@ -664,7 +643,6 @@ async function* openaiStreamToAnthropic(
   let hasEmittedFinalUsage = false
   let hasProcessedFinishReason = false
 
-  // Emit message_start
   yield {
     type: 'message_start',
     message: {
@@ -689,17 +667,9 @@ async function* openaiStreamToAnthropic(
 
   const decoder = new TextDecoder()
   let buffer = ''
-  const STREAM_IDLE_TIMEOUT_MS = 120_000 // 2 minutes without data = connection likely dead
+  const STREAM_IDLE_TIMEOUT_MS = 120_000
   let lastDataTime = Date.now()
 
-  /**
-   * Read from the stream with an idle timeout. If no data arrives within
-   * STREAM_IDLE_TIMEOUT_MS, assume the connection is dead and throw so
-   * withRetry can reconnect. This prevents indefinite hangs on stale
-   * SSE connections from OpenAI/Gemini during long-running sessions.
-   * Respects the caller's AbortSignal — clears the idle timer on abort
-   * so the rejection reason is AbortError, not a spurious idle timeout.
-   */
   async function readWithTimeout(): Promise<ReadableStreamReadResult<Uint8Array>> {
     return new Promise((resolve, reject) => {
       const timeoutId = setTimeout(() => {
@@ -709,8 +679,6 @@ async function* openaiStreamToAnthropic(
         ))
       }, STREAM_IDLE_TIMEOUT_MS)
 
-      // If the caller aborts, clear the timer so the AbortError surfaces
-      // cleanly instead of being masked by a spurious idle timeout.
       let abortCleanup: (() => void) | undefined
       if (signal) {
         abortCleanup = () => {
@@ -785,9 +753,6 @@ async function* openaiStreamToAnthropic(
       for (const choice of chunk.choices ?? []) {
         const delta = choice.delta
 
-        // Reasoning models (e.g. GLM-5, DeepSeek) may stream chain-of-thought
-        // in `reasoning_content` before the actual reply appears in `content`.
-        // Emit reasoning as a thinking block and content as a text block.
         if (delta.reasoning_content != null && delta.reasoning_content !== '') {
           if (!hasEmittedThinkingStart) {
             yield {
@@ -804,10 +769,7 @@ async function* openaiStreamToAnthropic(
           }
         }
 
-        // Text content — use != null to distinguish absent field from empty string,
-        // some providers send "" as first delta to signal streaming start
         if (delta.content != null && delta.content !== '') {
-          // Close thinking block if transitioning from reasoning to content
           if (hasEmittedThinkingStart && !hasClosedThinking) {
             yield { type: 'content_block_stop', index: contentBlockIndex }
             contentBlockIndex++
@@ -858,11 +820,9 @@ async function* openaiStreamToAnthropic(
           }
         }
 
-        // Tool calls
         if (delta.tool_calls) {
           for (const tc of delta.tool_calls) {
             if (tc.id && tc.function?.name) {
-              // New tool call starting — close any open thinking block first
               if (hasEmittedThinkingStart && !hasClosedThinking) {
                 yield { type: 'content_block_stop', index: contentBlockIndex }
                 contentBlockIndex++
@@ -892,7 +852,6 @@ async function* openaiStreamToAnthropic(
                   name: tc.function.name,
                   input: {},
                   ...(tc.extra_content ? { extra_content: tc.extra_content } : {}),
-                  // Extract Gemini signature from extra_content
                   ...((tc.extra_content?.google as any)?.thought_signature
                     ? {
                         signature: (tc.extra_content.google as any)
@@ -903,7 +862,6 @@ async function* openaiStreamToAnthropic(
               }
               contentBlockIndex++
 
-              // Emit any initial arguments
               if (tc.function.arguments && !normalizeAtStop) {
                 yield {
                   type: 'content_block_delta',
@@ -915,7 +873,6 @@ async function* openaiStreamToAnthropic(
                 }
               }
             } else if (tc.function?.arguments) {
-              // Continuation of existing tool call
               const active = activeToolCalls.get(tc.index)
               if (active) {
                 if (tc.function.arguments) {
@@ -939,28 +896,21 @@ async function* openaiStreamToAnthropic(
           }
         }
 
-        // Finish — guard ensures we only process finish_reason once even if
-        // multiple chunks arrive with finish_reason set (some providers do this)
         if (choice.finish_reason && !hasProcessedFinishReason) {
           hasProcessedFinishReason = true
 
-          // Close any open thinking block that wasn't closed by content transition
           if (hasEmittedThinkingStart && !hasClosedThinking) {
             yield { type: 'content_block_stop', index: contentBlockIndex }
             contentBlockIndex++
             hasClosedThinking = true
           }
-          // Close any open content blocks
           if (hasEmittedContentStart) {
             yield* closeActiveContentBlock()
           }
-          // Close active tool calls
           for (const [, tc] of activeToolCalls) {
             if (tc.normalizeAtStop) {
               let partialJson: string
               if (choice.finish_reason === 'length') {
-                // Truncated by max tokens — preserve raw buffer to avoid
-                // turning an incomplete tool call into an executable command
                 partialJson = tc.jsonBuffer
               } else {
                 const repairedStructuredJson = repairPossiblyTruncatedObjectJson(
@@ -1024,8 +974,6 @@ async function* openaiStreamToAnthropic(
                 ? 'max_tokens'
                 : 'end_turn'
           if (choice.finish_reason === 'content_filter' || choice.finish_reason === 'safety') {
-            // Gemini/Azure content safety filter blocked the response.
-            // Emit a visible text block so the user knows why output was truncated.
             if (!hasEmittedContentStart) {
               yield {
                 type: 'content_block_start',
@@ -1081,7 +1029,6 @@ async function* openaiStreamToAnthropic(
 
 class OpenAIShimStream {
   private generator: AsyncGenerator<AnthropicStreamEvent>
-  // The controller property is checked by claude.ts to distinguish streams from error messages
   controller = new AbortController()
 
   constructor(generator: AsyncGenerator<AnthropicStreamEvent>) {
@@ -1278,15 +1225,29 @@ class OpenAIShimMessages {
       params.system,
     )
 
+    // -------------------------------------------------------------------------
+    // OLLAMA FIX: disable streaming when tools are present.
+    // Ollama's /v1/chat/completions endpoint silently drops tool_calls when
+    // stream:true is set. Non-streaming mode returns tool calls correctly.
+    // See: ollama/ollama#9632, ollama/ollama#12557
+    // -------------------------------------------------------------------------
+    const hasTools = !!(params.tools && params.tools.length > 0)
+    const isOllama = isOllamaProvider(request.baseUrl)
+    const shouldStream = isOllama && hasTools ? false : (params.stream ?? false)
+
     const body: Record<string, unknown> = {
       model: request.resolvedModel,
       messages: openaiMessages,
-      stream: params.stream ?? false,
+      stream: shouldStream,
       store: false,
     }
-    // Convert max_tokens to max_completion_tokens for OpenAI API compatibility.
-    // Azure OpenAI requires max_completion_tokens and does not accept max_tokens.
-    // Ensure max_tokens is a valid positive number before using it.
+
+    // When Ollama is used, add num_ctx to increase context window beyond
+    // the default 2048 tokens which is too small for agentic workflows.
+    if (isOllama) {
+      body.options = { num_ctx: 32768 }
+    }
+
     const maxTokensValue = typeof params.max_tokens === 'number' && params.max_tokens > 0
       ? params.max_tokens
       : undefined
@@ -1300,7 +1261,7 @@ class OpenAIShimMessages {
       body.max_completion_tokens = maxCompletionTokensValue
     }
 
-    if (params.stream && !isLocalProviderUrl(request.baseUrl)) {
+    if (shouldStream && !isLocalProviderUrl(request.baseUrl)) {
       body.stream_options = { include_usage: true }
     }
 
@@ -1317,8 +1278,6 @@ class OpenAIShimMessages {
       delete body.max_completion_tokens
     }
 
-    // mistral and gemini don't recognize body.store — Gemini returns 400
-    // "Invalid JSON payload received. Unknown name 'store': Cannot find field."
     if (isMistral || isGeminiMode()) {
       delete body.store
     }
@@ -1362,8 +1321,6 @@ class OpenAIShimMessages {
 
     const isGemini = isEnvTruthy(process.env.CLAUDE_CODE_USE_GEMINI)
     const apiKey = this.providerOverride?.apiKey ?? process.env.OPENAI_API_KEY ?? ''
-    // Detect Azure endpoints by hostname (not raw URL) to prevent bypass via
-    // path segments like https://evil.com/cognitiveservices.azure.com/
     let isAzure = false
     try {
       const { hostname } = new URL(request.baseUrl)
@@ -1373,7 +1330,6 @@ class OpenAIShimMessages {
 
     if (apiKey) {
       if (isAzure) {
-        // Azure uses api-key header instead of Bearer token
         headers['api-key'] = apiKey
       } else {
         headers.Authorization = `Bearer ${apiKey}`
@@ -1395,21 +1351,14 @@ class OpenAIShimMessages {
       headers['X-GitHub-Api-Version'] = '2022-11-28'
     }
 
-    // Build the chat completions URL
-    // Azure Cognitive Services / Azure OpenAI require a deployment-specific path
-    // and an api-version query parameter.
-    // Standard format: {base}/openai/deployments/{model}/chat/completions?api-version={version}
-    // Non-Azure: {base}/chat/completions
     let chatCompletionsUrl: string
     if (isAzure) {
       const apiVersion = process.env.AZURE_OPENAI_API_VERSION ?? '2024-12-01-preview'
       const deployment = request.resolvedModel ?? process.env.OPENAI_MODEL ?? 'gpt-4o'
-      // If base URL already contains /deployments/, use it as-is with api-version
       if (/\/deployments\//i.test(request.baseUrl)) {
         const base = request.baseUrl.replace(/\/+$/, '')
         chatCompletionsUrl = `${base}/chat/completions?api-version=${apiVersion}`
       } else {
-        // Strip trailing /v1 or /openai/v1 if present, then build Azure path
         const base = request.baseUrl.replace(/\/(openai\/)?v1\/?$/, '').replace(/\/+$/, '')
         chatCompletionsUrl = `${base}/openai/deployments/${deployment}/chat/completions?api-version=${apiVersion}`
       }
@@ -1444,14 +1393,10 @@ class OpenAIShimMessages {
         await sleepMs(delaySec * 1000)
         continue
       }
-      // Read body exactly once here — Response body is a stream that can only
-      // be consumed a single time.
       const errorBody = await response.text().catch(() => 'unknown error')
       const rateHint =
         isGithub && response.status === 429 ? formatRetryAfterHint(response) : ''
 
-      // If GitHub Copilot returns error about /chat/completions,
-      // try the /responses endpoint (needed for GPT-5+ models)
       if (isGithub && response.status === 400) {
         if (errorBody.includes('/chat/completions') || errorBody.includes('not accessible')) {
           const responsesUrl = `${request.baseUrl}/responses`
@@ -1570,9 +1515,6 @@ class OpenAIShimMessages {
     const choice = data.choices?.[0]
     const content: Array<Record<string, unknown>> = []
 
-    // Some reasoning models (e.g. GLM-5) put their chain-of-thought in
-    // reasoning_content while content stays null. Preserve it as a thinking
-    // block, but do not surface it as visible assistant text.
     const reasoningText = choice?.message?.reasoning_content
     if (typeof reasoningText === 'string' && reasoningText) {
       content.push({ type: 'thinking', thinking: reasoningText })
@@ -1619,7 +1561,6 @@ class OpenAIShimMessages {
           name: tc.function.name,
           input,
           ...(tc.extra_content ? { extra_content: tc.extra_content } : {}),
-          // Extract Gemini signature from extra_content
           ...((tc.extra_content?.google as any)?.thought_signature
             ? { signature: (tc.extra_content.google as any).thought_signature }
             : {}),
@@ -1679,8 +1620,6 @@ export function createOpenAIShimClient(options: {
   hydrateGeminiAccessTokenFromSecureStorage()
   hydrateGithubModelsTokenFromSecureStorage()
 
-  // When Gemini provider is active, map Gemini env vars to OpenAI-compatible ones
-  // so the existing providerConfig.ts infrastructure picks them up correctly.
   if (isEnvTruthy(process.env.CLAUDE_CODE_USE_GEMINI)) {
     process.env.OPENAI_BASE_URL ??=
       process.env.GEMINI_BASE_URL ??
