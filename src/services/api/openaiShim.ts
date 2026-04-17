@@ -59,6 +59,18 @@ import {
   normalizeToolArguments,
   hasToolFieldMapping,
 } from './toolArgumentNormalization.js'
+import {
+  repairPossiblyTruncatedObjectJson,
+  repairStreamingJsonChunk,
+  extractJsonFromText,
+  extractJsonAggressive,
+  parseToolCalls,
+  validateToolCall,
+  generateToolCallId,
+  normalizeQwenRequestParams,
+  enhanceSystemPrompt,
+  QWEN_CODER_CONFIG,
+} from './qwenCoderParser.js'
 
 type SecretValueSource = Partial<{
   OPENAI_API_KEY: string
@@ -93,6 +105,21 @@ function isOllamaProvider(baseUrl: string | undefined): boolean {
     baseUrl.includes('localhost:11434') ||
     baseUrl.includes('127.0.0.1:11434') ||
     baseUrl.includes('ollama')
+  )
+}
+
+// ---------------------------------------------------------------------------
+// Qwen3-Coder detection — enables aggressive JSON repair and low temperature
+// ---------------------------------------------------------------------------
+function isQwenProvider(model: string | undefined, baseUrl: string | undefined): boolean {
+  const modelLower = (model || '').toLowerCase()
+  const urlLower = (baseUrl || '').toLowerCase()
+  
+  return (
+    modelLower.includes('qwen') ||
+    modelLower.includes('qwq') ||
+    urlLower.includes('qwen') ||
+    isEnvTruthy(process.env.CLAUDE_CODE_USE_QWEN)
   )
 }
 
@@ -833,7 +860,13 @@ async function* openaiStreamToAnthropic(
               }
 
               const toolBlockIndex = contentBlockIndex
-              const initialArguments = tc.function.arguments ?? ''
+              let initialArguments = tc.function.arguments ?? ''
+              
+              // QWEN3-CODER: Apply streaming JSON repair to each chunk
+              if (isQwen && initialArguments) {
+                initialArguments = repairStreamingJsonChunk(initialArguments)
+              }
+              
               const normalizeAtStop = hasToolFieldMapping(tc.function.name)
               activeToolCalls.set(tc.index, {
                 id: tc.id,
@@ -862,21 +895,28 @@ async function* openaiStreamToAnthropic(
               }
               contentBlockIndex++
 
-              if (tc.function.arguments && !normalizeAtStop) {
+              if (initialArguments && !normalizeAtStop) {
                 yield {
                   type: 'content_block_delta',
                   index: toolBlockIndex,
                   delta: {
                     type: 'input_json_delta',
-                    partial_json: tc.function.arguments,
+                    partial_json: initialArguments,
                   },
                 }
               }
             } else if (tc.function?.arguments) {
               const active = activeToolCalls.get(tc.index)
               if (active) {
-                if (tc.function.arguments) {
-                  active.jsonBuffer += tc.function.arguments
+                let argsChunk = tc.function.arguments
+                
+                // QWEN3-CODER: Apply streaming JSON repair to argument chunks
+                if (isQwen && argsChunk) {
+                  argsChunk = repairStreamingJsonChunk(argsChunk)
+                }
+                
+                if (argsChunk) {
+                  active.jsonBuffer += argsChunk
                 }
 
                 if (active.normalizeAtStop) {
@@ -888,7 +928,7 @@ async function* openaiStreamToAnthropic(
                   index: active.index,
                   delta: {
                     type: 'input_json_delta',
-                    partial_json: tc.function.arguments,
+                    partial_json: argsChunk || '',
                   },
                 }
               }
@@ -1216,13 +1256,22 @@ class OpenAIShimMessages {
     params: ShimCreateParams,
     options?: { signal?: AbortSignal; headers?: Record<string, string> },
   ): Promise<Response> {
+    // Detect Qwen provider for special handling
+    const isQwen = isQwenProvider(request.resolvedModel, request.baseUrl)
+    
+    // Enhance system prompt for Qwen coding agent behavior
+    let systemPrompt = params.system
+    if (isQwen) {
+      systemPrompt = enhanceSystemPrompt(typeof systemPrompt === 'string' ? systemPrompt : undefined)
+    }
+
     const openaiMessages = convertMessages(
       params.messages as Array<{
         role: string
         message?: { role?: string; content?: unknown }
         content?: unknown
       }>,
-      params.system,
+      systemPrompt,
     )
 
     // -------------------------------------------------------------------------
@@ -1246,6 +1295,12 @@ class OpenAIShimMessages {
     // the default 2048 tokens which is too small for agentic workflows.
     if (isOllama) {
       body.options = { num_ctx: 32768 }
+    }
+
+    // QWEN3-CODER OPTIMIZATION: Force low temperature and normalize parameters
+    if (isQwen) {
+      const normalizedParams = normalizeQwenRequestParams(body)
+      Object.assign(body, normalizedParams)
     }
 
     const maxTokensValue = typeof params.max_tokens === 'number' && params.max_tokens > 0
@@ -1549,12 +1604,22 @@ class OpenAIShimMessages {
       }
     }
 
+    // Handle tool calls with Qwen-specific repair layer
     if (choice?.message?.tool_calls) {
       for (const tc of choice.message.tool_calls) {
-        const input = normalizeToolArguments(
-          tc.function.name,
-          tc.function.arguments,
-        )
+        let inputStr = tc.function.arguments || '{}'
+        
+        // QWEN3-CODER: Apply aggressive JSON repair before normalization
+        if (isQwen) {
+          const repaired = repairPossiblyTruncatedObjectJson(inputStr)
+          if (repaired) {
+            inputStr = repaired
+            logForDebugging('[QwenCoder] Repaired truncated JSON in tool call', { tool: tc.function.name })
+          }
+        }
+        
+        const input = normalizeToolArguments(tc.function.name, inputStr)
+        
         content.push({
           type: 'tool_use',
           id: tc.id,
@@ -1565,6 +1630,30 @@ class OpenAIShimMessages {
             ? { signature: (tc.extra_content.google as any).thought_signature }
             : {}),
         })
+      }
+    }
+    
+    // QWEN3-CODER: Handle case where model outputs text containing embedded tool calls
+    if (isQwen && content.length === 0) {
+      const textContent = choice?.message?.content
+      if (typeof textContent === 'string') {
+        const parsedCalls = parseToolCalls(textContent)
+        if (parsedCalls.length > 0) {
+          logForDebugging(`[QwenCoder] Extracted ${parsedCalls.length} tool calls from text response`)
+          for (const call of parsedCalls) {
+            const validation = validateToolCall(call)
+            if (validation.valid) {
+              content.push({
+                type: 'tool_use',
+                id: call.id || generateToolCallId(),
+                name: call.name,
+                input: call.input,
+              })
+            } else {
+              logForDebugging(`[QwenCoder] Invalid tool call: ${validation.errors.join(', ')}`, { level: 'warn' })
+            }
+          }
+        }
       }
     }
 
