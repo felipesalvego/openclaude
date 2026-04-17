@@ -1,12 +1,1 @@
-node_modules/
-dist/
-*.tsbuildinfo
-.env
-.env.*
-!.env.example
-.openclaude-profile.json
-reports/
-GEMINI.md
-package-lock.json
-/.claude
-coverage/
+Nothing needs to be added to .gitignore since the changes only include source/config files (.md, .sh) without any build artifacts, dependencies, or temporary files.
